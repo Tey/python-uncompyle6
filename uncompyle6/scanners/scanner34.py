@@ -14,11 +14,12 @@ import dis, inspect
 from array import array
 import uncompyle6.scanners.scanner3 as scan3
 
-from uncompyle6 import PYTHON_VERSION
 from uncompyle6.code import iscode
 from uncompyle6.scanner import Token
+from uncompyle6 import PYTHON3
 
 # Get all the opcodes into globals
+import uncompyle6.opcodes.opcode_34 as op3
 globals().update(dis.opmap)
 
 import uncompyle6.opcodes.opcode_34
@@ -29,24 +30,18 @@ from uncompyle6.opcodes.opcode_34 import *
 
 class Scanner34(scan3.Scanner3):
 
-    def disassemble(self, co, classname=None, code_objects={}):
-        fn = self.disassemble_built_in if PYTHON_VERSION == 3.4 \
-            else self.disassemble_generic
-        return fn(co, classname, code_objects=code_objects)
-
-    def disassemble_built_in(self, co, classname=None,
-                             code_objects={}):
+    # Note: we can't use built-in disassembly routines, unless
+    # we do post-processing like we do here.
+    def disassemble(self, co, classname=None,
+                    code_objects={}):
         # Container for tokens
         tokens = []
         customize = {}
-        self.code = array('B', co.co_code)
+        self.code = code = array('B', co.co_code)
+        codelen = len(code)
         self.build_lines_data(co)
         self.build_prev_op()
-
-        # Get jump targets
-        # Format: {target offset: [jump offsets]}
-        jump_targets = self.find_jump_targets()
-        bytecode = dis.Bytecode(co)
+        self.code_objects = code_objects
 
         # self.lines contains (block,addrLastInstr)
         if classname:
@@ -57,55 +52,121 @@ class Scanner34(scan3.Scanner3):
                     return name[len(classname) - 2:]
                 return name
 
-            # free = [ unmangle(name) for name in (co.co_cellvars + co.co_freevars) ]
-            # names = [ unmangle(name) for name in co.co_names ]
-            # varnames = [ unmangle(name) for name in co.co_varnames ]
+            free = [ unmangle(name) for name in (co.co_cellvars + co.co_freevars) ]
+            names = [ unmangle(name) for name in co.co_names ]
+            varnames = [ unmangle(name) for name in co.co_varnames ]
         else:
-            # free = co.co_cellvars + co.co_freevars
-            # names = co.co_names
-            # varnames = co.co_varnames
+            free = co.co_cellvars + co.co_freevars
+            names = co.co_names
+            varnames = co.co_varnames
             pass
 
         # Scan for assertions. Later we will
         # turn 'LOAD_GLOBAL' to 'LOAD_ASSERT' for those
         # assertions
-        self.load_asserts = set()
-        bs = list(bytecode)
-        n = len(bs)
-        for i in range(n):
-            inst = bs[i]
-            if inst.opname == 'POP_JUMP_IF_TRUE' and  i+1 < n:
-                next_inst = bs[i+1]
-                if (next_inst.opname == 'LOAD_GLOBAL' and
-                    next_inst.argval == 'AssertionError'):
-                    self.load_asserts.add(next_inst.offset)
 
-        for inst in bytecode:
-            if inst.offset in jump_targets:
+        self.load_asserts = set()
+        for i in self.op_range(0, codelen):
+            if self.code[i] == POP_JUMP_IF_TRUE and self.code[i+3] == LOAD_GLOBAL:
+                if names[self.get_argument(i+3)] == 'AssertionError':
+                    self.load_asserts.add(i+3)
+
+        # Get jump targets
+        # Format: {target offset: [jump offsets]}
+        jump_targets = self.find_jump_targets()
+
+        # contains (code, [addrRefToCode])
+        last_stmt = self.next_stmt[0]
+        i = self.next_stmt[last_stmt]
+        replace = {}
+
+        imports = self.all_instr(0, codelen, (IMPORT_NAME, IMPORT_FROM, IMPORT_STAR))
+        if len(imports) > 1:
+            last_import = imports[0]
+            for i in imports[1:]:
+                if self.lines[last_import].next > i:
+                    if self.code[last_import] == IMPORT_NAME == self.code[i]:
+                        replace[i] = 'IMPORT_NAME_CONT'
+                last_import = i
+
+        # Initialize extended arg at 0. When extended arg op is encountered,
+        # variable preserved for next cycle and added as arg for next op
+        extended_arg = 0
+
+        for offset in self.op_range(0, codelen):
+            # Add jump target tokens
+            if offset in jump_targets:
                 jump_idx = 0
-                for jump_offset in jump_targets[inst.offset]:
+                for jump_offset in jump_targets[offset]:
                     tokens.append(Token('COME_FROM', None, repr(jump_offset),
-                                        offset='%s_%s' % (inst.offset, jump_idx)))
+                                        offset='%s_%s' % (offset, jump_idx)))
                     jump_idx += 1
                     pass
                 pass
 
-            pattr =  inst.argrepr
-            opname = inst.opname
+            op = code[offset]
+            op_name = op3.opname[op]
 
-            if opname in ['LOAD_CONST']:
-                const = inst.argval
+            oparg = None; pattr = None
+
+            if op >= op3.HAVE_ARGUMENT:
+                oparg = self.get_argument(offset) + extended_arg
+                extended_arg = 0
+                if op == op3.EXTENDED_ARG:
+                    extended_arg = oparg * scan.L65536
+                    continue
+                if op in op3.hasconst:
+                    const = co.co_consts[oparg]
+                    if not PYTHON3 and isinstance(const, str):
+                        if const in code_objects:
+                            const = code_objects[const]
+                    if iscode(const):
+                        oparg = const
+                        if const.co_name == '<lambda>':
+                            assert op_name == 'LOAD_CONST'
+                            op_name = 'LOAD_LAMBDA'
+                        elif const.co_name == '<genexpr>':
+                            op_name = 'LOAD_GENEXPR'
+                        elif const.co_name == '<dictcomp>':
+                            op_name = 'LOAD_DICTCOMP'
+                        elif const.co_name == '<setcomp>':
+                            op_name = 'LOAD_SETCOMP'
+                        elif const.co_name == '<listcomp>':
+                            op_name = 'LOAD_LISTCOMP'
+                        # verify() uses 'pattr' for comparison, since 'attr'
+                        # now holds Code(const) and thus can not be used
+                        # for comparison (todo: think about changing this)
+                        # pattr = 'code_object @ 0x%x %s->%s' %\
+                        # (id(const), const.co_filename, const.co_name)
+                        pattr = '<code_object ' + const.co_name + '>'
+                    else:
+                        pattr = const
+                elif op in op3.hasname:
+                    pattr = names[oparg]
+                elif op in op3.hasjrel:
+                    pattr = repr(offset + 3 + oparg)
+                elif op in op3.hasjabs:
+                    pattr = repr(oparg)
+                elif op in op3.haslocal:
+                    pattr = varnames[oparg]
+                elif op in op3.hascompare:
+                    pattr = op3.cmp_op[oparg]
+                elif op in op3.hasfree:
+                    pattr = free[oparg]
+
+            if op_name in ['LOAD_CONST']:
+                const = oparg
                 if iscode(const):
                     if const.co_name == '<lambda>':
-                        opname = 'LOAD_LAMBDA'
+                        op_name = 'LOAD_LAMBDA'
                     elif const.co_name == '<genexpr>':
-                        opname = 'LOAD_GENEXPR'
+                        op_name = 'LOAD_GENEXPR'
                     elif const.co_name == '<dictcomp>':
-                        opname = 'LOAD_DICTCOMP'
+                        op_name = 'LOAD_DICTCOMP'
                     elif const.co_name == '<setcomp>':
-                        opname = 'LOAD_SETCOMP'
+                        op_name = 'LOAD_SETCOMP'
                     elif const.co_name == '<listcomp>':
-                        opname = 'LOAD_LISTCOMP'
+                        op_name = 'LOAD_LISTCOMP'
                     # verify() uses 'pattr' for comparison, since 'attr'
                     # now holds Code(const) and thus can not be used
                     # for comparison (todo: think about changing this)
@@ -115,43 +176,48 @@ class Scanner34(scan3.Scanner3):
                 else:
                     pattr = const
                     pass
-            elif opname in ('BUILD_LIST', 'BUILD_TUPLE', 'BUILD_SET', 'BUILD_SLICE',
+            elif op_name in ('BUILD_LIST', 'BUILD_TUPLE', 'BUILD_SET', 'BUILD_SLICE',
                             'UNPACK_SEQUENCE',
                             'MAKE_FUNCTION', 'MAKE_CLOSURE',
                             'DUP_TOPX', 'RAISE_VARARGS'
                             ):
-                # if opname == 'BUILD_TUPLE' and \
+                # if op_name == 'BUILD_TUPLE' and \
                 #     self.code[self.prev[offset]] == LOAD_CLOSURE:
                 #     continue
                 # else:
                 #     op_name = '%s_%d' % (op_name, oparg)
-                #     if opname != BUILD_SLICE:
+                #     if op_name != BUILD_SLICE:
                 #         customize[op_name] = oparg
-                opname = '%s_%d' % (opname, inst.argval)
-                if inst.opname != 'BUILD_SLICE':
-                    customize[opname] = inst.argval
+                op_name = '%s_%d' % (op_name, oparg)
+                if op_name != 'BUILD_SLICE':
+                    customize[op_name] = oparg
 
-            elif opname == 'JUMP_ABSOLUTE':
-                pattr = inst.argval
-                target = self.get_target(inst.offset)
-                if target < inst.offset:
-                    if (inst.offset in self.stmts and
-                        self.code[inst.offset+3] not in (END_FINALLY, POP_BLOCK)
+            elif op_name == 'JUMP_ABSOLUTE':
+                pattr = oparg
+                target = self.get_target(offset)
+                if target < offset:
+                    if (offset in self.stmts and
+                        self.code[offset+3] not in (END_FINALLY, POP_BLOCK)
                         and offset not in self.not_continue):
-                        opname = 'CONTINUE'
+                        op_name = 'CONTINUE'
                     else:
-                        opname = 'JUMP_BACK'
+                        op_name = 'JUMP_BACK'
 
-            elif inst.offset in self.load_asserts:
-                opname = 'LOAD_ASSERT'
+            elif offset in self.load_asserts:
+                op_name = 'LOAD_ASSERT'
+
+            if offset in self.linestarts:
+                linestart = self.linestarts[offset]
+            else:
+                linestart = None
 
             tokens.append(
                 Token(
-                    type_ = opname,
-                    attr = inst.argval,
+                    type_ = op_name,
+                    attr = oparg,
                     pattr = pattr,
-                    offset = inst.offset,
-                    linestart = inst.starts_line,
+                    offset = offset,
+                    linestart = linestart,
                     )
                 )
             pass
